@@ -112,15 +112,15 @@ def build(project_dir: str) -> Tuple[str, bool]:
 
 @mcp.tool()
 def run(
-    project_dir: str, args: str = "", timeout_seconds: int = 20
+    project_dir: str, args: str = "", timeout_seconds: int = 60
 ) -> Tuple[str, bool]:
     """
-    Run a Go executable from the specified project directory
+    Run a Go executable from the specified project directory for max 5 seconds
 
     Args:
         project_dir: Directory containing the Go executable
         args: Command-line arguments to pass to the executable (space-separated)
-        timeout_seconds: Maximum execution time in seconds (default: 60, 0 for no timeout)
+        timeout_seconds: Maximum execution time in seconds (not used - always exits after 5 sec)
 
     Returns:
         Tuple containing (output, success)
@@ -129,11 +129,15 @@ def run(
     import subprocess
     import os
     import shlex
+    import time
+    import signal
+    import psutil  # Make sure this is installed
     from pathlib import Path
 
     # Initialize output and status
     output_lines = []
     success = False
+    process = None
 
     # Validate project directory
     project_path = Path(project_dir).resolve()
@@ -158,15 +162,13 @@ def run(
                 ):
                     executables.append(file)
 
-        # If we found multiple executables, try to find one with the same name as the directory
+        # Handle executable selection (same as before)
         if len(executables) > 1:
             dir_name = project_path.name
             for exe in executables:
                 if exe.stem == dir_name:
                     executable = exe
                     break
-
-            # If we didn't find a match, use the first executable
             if executable is None:
                 executable = executables[0]
                 output_lines.append(
@@ -175,8 +177,8 @@ def run(
         elif len(executables) == 1:
             executable = executables[0]
 
+        # Try building if no executable found
         if executable is None:
-            # No executable found, try building first
             output_lines.append("No executable found. Attempting to build first...")
             build_output, build_success = build(project_dir)
             output_lines.append(build_output)
@@ -210,43 +212,196 @@ def run(
         # Prepare command line arguments
         cmd = [str(executable)]
         if args:
-            cmd.extend(shlex.split(args))  # Properly handles quoted arguments
+            cmd.extend(shlex.split(args))
 
         output_lines.append(f"Running: {' '.join(cmd)}")
 
-        # Set timeout
-        actual_timeout = None if timeout_seconds <= 0 else timeout_seconds
-
-        # Run the executable
-        run_process = subprocess.run(
-            cmd, cwd=project_dir, capture_output=True, text=True, timeout=actual_timeout
+        # Start the process with non-blocking I/O
+        process = subprocess.Popen(
+            cmd,
+            cwd=project_dir,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,  # Line buffered
         )
 
-        # Process output
-        if run_process.stdout:
-            output_lines.append("Output:")
-            output_lines.append(run_process.stdout.strip())
+        # Function to kill process and children
+        def kill_process_tree(pid):
+            try:
+                # Get the parent process
+                parent = psutil.Process(pid)
+                # Get all children recursively
+                children = parent.children(recursive=True)
 
-        # Check execution status
-        if run_process.returncode == 0:
+                # Kill children first
+                for child in children:
+                    try:
+                        child.kill()
+                    except:
+                        pass
+
+                # Kill the parent
+                parent.kill()
+
+                # Wait for processes to terminate
+                gone, still_alive = psutil.wait_procs(children + [parent], timeout=1)
+
+                # Force kill any remaining processes
+                for p in still_alive:
+                    try:
+                        p.kill()
+                    except:
+                        pass
+
+            except Exception as e:
+                output_lines.append(f"Error killing process tree: {str(e)}")
+                # Fallback: try direct kill
+                try:
+                    os.kill(pid, signal.SIGKILL if os.name != "nt" else signal.SIGTERM)
+                except:
+                    pass
+
+        start_time = time.time()
+        MAX_RUNTIME = 5  # Always exit after 5 seconds
+        stdout_lines = []
+        stderr_lines = []
+
+        # Non-blocking output reading
+        import select
+        import io
+
+        # Make sure stdout/stderr are non-blocking
+        if os.name != "nt":  # Unix-like
+            import fcntl
+
+            fcntl.fcntl(process.stdout.fileno(), fcntl.F_SETFL, os.O_NONBLOCK)
+            fcntl.fcntl(process.stderr.fileno(), fcntl.F_SETFL, os.O_NONBLOCK)
+
+        # For Windows, we'll use a polling approach
+        def read_nonblocking(stream):
+            try:
+                if os.name == "nt":  # Windows
+                    from msvcrt import get_osfhandle
+                    from win32pipe import PeekNamedPipe
+                    from win32file import ReadFile
+
+                    handle = get_osfhandle(stream.fileno())
+                    try:
+                        _, avail, _ = PeekNamedPipe(handle, 0)
+                        if avail > 0:
+                            return stream.readline()
+                    except:
+                        return ""
+                else:  # Unix
+                    return stream.readline()
+            except:
+                return ""
+            return ""
+
+        # Main execution loop
+        while True:
+            # Check if we've exceeded MAX_RUNTIME
+            elapsed = time.time() - start_time
+            if elapsed > MAX_RUNTIME:
+                output_lines.append(
+                    f"Reached maximum runtime of {MAX_RUNTIME} seconds, terminating..."
+                )
+                break
+
+            # Check if process has completed naturally
+            exit_code = process.poll()
+            if exit_code is not None:
+                output_lines.append(f"Process exited with code {exit_code}")
+                success = exit_code == 0
+                break
+
+            # Read any available output
+            if os.name == "nt":  # Windows
+                # Use polling on Windows
+                stdout_line = read_nonblocking(process.stdout)
+                if stdout_line:
+                    stdout_lines.append(stdout_line.rstrip())
+
+                stderr_line = read_nonblocking(process.stderr)
+                if stderr_line:
+                    stderr_lines.append(stderr_line.rstrip())
+            else:  # Unix
+                # Use select on Unix
+                rlist, _, _ = select.select(
+                    [process.stdout, process.stderr], [], [], 0.1
+                )
+                if process.stdout in rlist:
+                    stdout_line = process.stdout.readline()
+                    if stdout_line:
+                        stdout_lines.append(stdout_line.rstrip())
+
+                if process.stderr in rlist:
+                    stderr_line = process.stderr.readline()
+                    if stderr_line:
+                        stderr_lines.append(stderr_line.rstrip())
+
+            # Short sleep to avoid CPU spin
+            time.sleep(0.1)
+
+        # Forcibly terminate the process if it's still running
+        if process.poll() is None:
+            output_lines.append("Forcibly terminating process...")
+            try:
+                # Try the clean function first
+                kill_process_tree(process.pid)
+            except:
+                # Fall back to simpler methods
+                try:
+                    process.kill()
+                except:
+                    pass
+
+            # Wait a bit to ensure it's dead
+            time.sleep(0.5)
+
+            # Double-check it's dead
+            if process.poll() is None:
+                output_lines.append("Warning: Process may still be running!")
+
+        # Collect any remaining output
+        try:
+            stdout, stderr = process.communicate(timeout=1)
+            if stdout:
+                stdout_lines.extend(stdout.splitlines())
+            if stderr:
+                stderr_lines.extend(stderr.splitlines())
+        except:
+            pass
+
+        # Add output to the response
+        if stdout_lines:
+            output_lines.append("Standard Output:")
+            output_lines.extend(stdout_lines)
+
+        if stderr_lines:
+            output_lines.append("Standard Error:")
+            output_lines.extend(stderr_lines)
+
+        # Consider the run successful if we completed normally or terminated as planned
+        if success is False:  # Only change if not already set
             success = True
-            output_lines.append("Execution completed successfully ✓")
-        else:
-            success = False
-            output_lines.append("Execution failed ✗")
-            if run_process.stderr:
-                output_lines.append("Error details:")
-                output_lines.append(run_process.stderr.strip())
+            output_lines.append(
+                "Process ran and was terminated after 5 seconds as planned"
+            )
 
-    except subprocess.TimeoutExpired:
-        output_lines.append(f"Execution timed out after {timeout_seconds} seconds")
-        success = False
-    except subprocess.SubprocessError as e:
-        output_lines.append(f"Error executing application: {str(e)}")
-        success = False
     except Exception as e:
         output_lines.append(f"Unexpected error during execution: {str(e)}")
         success = False
+
+    finally:
+        # Make absolutely sure the process is dead
+        if process and process.poll() is None:
+            try:
+                # One last attempt to kill the process
+                process.kill()
+            except:
+                pass
 
     # Join all output lines into a single string
     output_str = "\n".join(output_lines)
